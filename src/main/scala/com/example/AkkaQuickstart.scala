@@ -1,54 +1,94 @@
-//#full-example
 package com.example
 
 
-import akka.actor.Scheduler
-import akka.actor.typed.ActorRef
-import akka.actor.typed.ActorSystem
-import akka.actor.typed.Behavior
+import akka.actor
 import akka.actor.typed.scaladsl.Behaviors
-import akka.util.Timeout
-import com.example.Cache.{CachedDeviceIds, Get}
+import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
+import com.example.Cache.CacheRequests
 
-import scala.concurrent.{ExecutionContextExecutor, Future}
 import scala.concurrent.duration._
-import scala.util.{Failure, Success}
-import akka.actor.typed.scaladsl.AskPattern._
+import scala.concurrent.{ExecutionContextExecutor, Future}
+import scala.util.{Failure, Random, Success}
 
 case class RequestId(s: String)
+
 case class DeviceId(s: String)
 
 object Cache {
-  final case class Get(requestId: RequestId, replyTo: ActorRef[CachedDeviceIds])
-  final case class CachedDeviceIds(devices: List[DeviceId])
 
-  def cached(devices: List[DeviceId]): Behavior[Get] =
-    Behaviors.receive { (context, message) =>
-      context.log.info("Cache request for requestId {}.", message.requestId)
-      message.replyTo ! CachedDeviceIds(devices)
-      Behaviors.same
+  sealed trait CacheRequests
+  final case class Get(requestId: RequestId, replyTo: ActorRef[CacheResponses]) extends CacheRequests
+  final case class CachedDevices(devices: List[DeviceId]) extends CacheResponses
+  final private case class Devices(devices: List[DeviceId]) extends CacheRequests
+
+  sealed trait CacheResponses
+  final case object EmptyCache extends CacheResponses
+  final private case object Tick extends CacheRequests
+  final private case object CacheRefreshFailed extends CacheRequests
+
+  private case object TimerKey
+
+  val empty: Behavior[CacheRequests] =
+    Behaviors.withTimers { timer =>
+      timer.startPeriodicTimer(TimerKey, Tick, 5.second)
+
+      Behaviors.setup { context =>
+        refreshCache(context.self, context.system)
+
+        Behaviors.receiveMessage[CacheRequests] {
+          case Get(requestId, replyTo) =>
+            context.log.info("Empty cache request for requestId {}.", requestId)
+            replyTo ! EmptyCache
+            Behaviors.same
+          case Devices(devices) =>
+            context.log.info("Initialized cache.")
+            cached(devices)
+          case CacheRefreshFailed =>
+            context.log.error("Failed to initialize cache. Will retry.")
+            Behaviors.same
+          case Tick =>
+            context.log.info("Refreshing cache.")
+            refreshCache(context.self, context.system)
+            Behaviors.same
+        }
+      }
     }
+
+  private def cached(devices: List[DeviceId]): Behavior[CacheRequests] =
+    Behaviors.receive { (context, message) =>
+      message match {
+        case Get(requestId, replyTo) =>
+          context.log.info("Cache request for requestId {}.", requestId)
+          replyTo ! CachedDevices(devices)
+          Behaviors.same
+        case Devices(devices) =>
+          context.log.info("Updated cache.")
+          cached(devices)
+        case CacheRefreshFailed =>
+          context.log.error("Failed to refresh cache.")
+          Behaviors.same
+        case Tick =>
+          context.log.info("Refreshing cache.")
+          refreshCache(context.self, context.system)
+          Behaviors.same
+      }
+    }
+
+  private def refreshCache(self: ActorRef[CacheRequests], system: ActorSystem[Nothing]): Unit = {
+    import akka.actor.typed.scaladsl.adapter._
+    implicit val untypedSystem: actor.ActorSystem = system.toClassic
+    implicit val ec: ExecutionContextExecutor = untypedSystem.dispatcher
+
+    val random = new Random()
+
+    // From a device source
+    Future.successful(List.fill(100)(random.nextInt(100).toString).map(DeviceId)).onComplete {
+      case Success(devices) => self ! Devices(devices)
+      case Failure(_) => self ! CacheRefreshFailed
+    }
+  }
 }
 
 object SimpleCache extends App {
-  val deviceIds = List(
-    DeviceId("27ba0ec2-bd08-4473-bb3a-759bf76890ca"),
-    DeviceId("e3056593-c56d-4fee-8e05-d1d6918a4f21"),
-    DeviceId("6fefd14c-c5b2-498e-a669-0b70d414c9cb")
-  )
-
-  val cache = ActorSystem[Get](Cache.cached(deviceIds), "cache")
-
-  implicit val timeout: Timeout             = 5.seconds
-  implicit val scheduler: Scheduler         = cache.scheduler
-  implicit val ec: ExecutionContextExecutor = cache.executionContext
-
-  val requestId = RequestId("12345")
-
-  val result: Future[CachedDeviceIds] = cache.ref.ask(ref => Cache.Get(requestId, ref))
-
-  result.onComplete {
-    case Success(_) => println("Devices!")
-    case Failure(_) => println("Failure!")
-  }
+  val cache = ActorSystem[CacheRequests](Cache.empty, "cache")
 }
