@@ -1,50 +1,19 @@
 package com.example
 
-
+import akka.actor
 import akka.actor.typed.scaladsl.Behaviors
-import akka.actor.typed.{ActorRef, ActorSystem, Behavior, SupervisorStrategy}
-import com.example.Cache.{CacheRequests, Devices}
+import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
+import akka.stream.ActorMaterializer
+import akka.stream.scaladsl.{RestartSource, Sink, Source}
+import com.example.Cache.Devices
 
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContextExecutor, Future}
-import scala.util.{Failure, Random, Success}
+import scala.util.Random
 
 case class RequestId(s: String)
 
 case class DeviceId(s: String)
-
-object Timer {
-  private case object TimerKey
-
-  sealed trait TimerMessage
-  private case object Tick extends TimerMessage
-  private case class FailedRequest(ex: Throwable) extends TimerMessage
-  private case class SuccessfulRequest(devices: List[DeviceId]) extends TimerMessage
-
-  def start(cache: ActorRef[CacheRequests], request: => Future[List[DeviceId]]): Behavior[TimerMessage] =
-    Behaviors.withTimers { timer =>
-      timer.startPeriodicTimer(TimerKey, Tick, 5.seconds)
-      Behaviors.receive[TimerMessage] { (context, message) =>
-        message match {
-          case Tick =>
-            context.log.info("Executing request.")
-            implicit val ec: ExecutionContextExecutor = context.executionContext
-            request.onComplete {
-              case Success(devices) => context.self ! SuccessfulRequest(devices)
-              case Failure(ex)      => context.self ! FailedRequest(ex)
-            }
-            Behaviors.same
-          case SuccessfulRequest(devices) =>
-            context.log.info("Successful response.")
-            cache ! Devices(devices)
-            Behaviors.same
-          case FailedRequest(ex) =>
-            context.log.error("Failed response.")
-            throw ex
-        }
-      }
-    }
-}
 
 object Cache {
   sealed trait CacheRequests
@@ -86,21 +55,32 @@ object Main {
   case class Ping()
 
   def apply(): Behavior[Ping] = Behaviors.setup {context =>
+    import akka.actor.typed.scaladsl.adapter._
+    implicit val untypedSystem: actor.ActorSystem = context.system.toClassic
+    implicit val ec: ExecutionContextExecutor = untypedSystem.dispatcher
+    implicit val mat: ActorMaterializer = ActorMaterializer()
+
     val random = new Random()
     def getDevices: Future[List[DeviceId]] =
       Future.successful(List.fill(100)(random.nextInt(100).toString).map(DeviceId))
     val cache = context.spawn(Cache.empty, "cache")
-    val timer = Behaviors
-    .supervise {
-      Timer.start(cache, getDevices)
-    }
-    .onFailure[Throwable] {
-      SupervisorStrategy.restartWithBackoff(
+    RestartSource
+      .withBackoff(
         minBackoff = 0.seconds,
         maxBackoff = 60.seconds,
-        randomFactor = 0.1)
-    }
-    context.spawn(timer, "timer")
+        randomFactor = 0.1
+      ) { () =>
+        Source
+          .tick(initialDelay = 0.seconds, interval = 5.seconds, tick = ())
+          .mapAsync(parallelism = 1) { _ =>
+            getDevices
+          }
+          .map(devices => cache ! Devices(devices))
+          .recover {
+            case ex => context.system.log.error("Failed to get devices : {}", ex)
+          }
+      }
+      .runWith(Sink.ignore)
     Behaviors.same
   }
 }
