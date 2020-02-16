@@ -9,23 +9,23 @@ import com.example.Cache.Devices
 
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContextExecutor, Future}
-import scala.util.Random
+import scala.util.{Failure, Random, Success}
 
 case class RequestId(s: String)
 
 case class DeviceId(s: String)
 
 object Cache {
-  sealed trait CacheRequests
-  final case class Get(requestId: RequestId, replyTo: ActorRef[CacheResponses]) extends CacheRequests
-  final case class Devices(devices: List[DeviceId]) extends CacheRequests
+  sealed trait Command
+  final case class Get(requestId: RequestId, replyTo: ActorRef[GetReply]) extends Command
+  final case class Devices(devices: List[DeviceId]) extends Command
 
-  sealed trait CacheResponses
-  final case object EmptyCache extends CacheResponses
-  final case class CachedDevices(devices: List[DeviceId]) extends CacheResponses
+  sealed trait GetReply
+  final case object EmptyCache extends GetReply
+  final case class CachedDevices(devices: List[DeviceId]) extends GetReply
 
-  val empty: Behavior[CacheRequests] =
-    Behaviors.receive[CacheRequests] { (context, message) =>
+  def apply(): Behavior[Command] =
+    Behaviors.receive[Command] { (context, message) =>
       message match {
         case Get(requestId, replyTo) =>
           context.log.info("Empty cache request for requestId {}.", requestId)
@@ -37,7 +37,7 @@ object Cache {
       }
     }
 
-  private def cached(devices: List[DeviceId]): Behavior[CacheRequests] =
+  private def cached(devices: List[DeviceId]): Behavior[Command] =
     Behaviors.receive { (context, message) =>
       message match {
         case Get(requestId, replyTo) =>
@@ -63,7 +63,7 @@ object Main {
     val random = new Random()
     def getDevices: Future[List[DeviceId]] =
       Future.successful(List.fill(100)(random.nextInt(100).toString).map(DeviceId))
-    val cache = context.spawn(Cache.empty, "cache")
+    val cache = context.spawn(Cache(), "cache")
     RestartSource
       .withBackoff(
         minBackoff = 0.seconds,
@@ -76,11 +76,12 @@ object Main {
             getDevices
           }
           .map(devices => cache ! Devices(devices))
-          .recover {
-            case ex => context.system.log.error("Failed to get devices : {}", ex)
-          }
       }
       .runWith(Sink.ignore)
+      .onComplete {
+        case Failure(ex) => context.system.log.error("Failed to get devices : {}", ex)
+        case Success(_) =>
+      }
     Behaviors.same
   }
 }
